@@ -81,9 +81,10 @@
     Subject Alternative Name / domain to search for (e.g. papercut.contoso.com).
     When InputMode = LETSENCRYPT and -LetsEncryptPath is not supplied, the script
     searches these common ACME client locations automatically:
-      Posh-ACME  : %LOCALAPPDATA%\Posh-ACME\*\*\<domain>\
-      Certbot    : C:\Certbot\archive\<domain>\  and  C:\Certbot\live\<domain>\
-      Win-ACME   : C:\ProgramData\win-acme\*\Certificates\  (flat, SAN-scanned)
+      Posh-ACME        : %LOCALAPPDATA%\Posh-ACME\*\*\<domain>\
+      Certbot          : C:\Certbot\archive\<domain>\  and  C:\Certbot\live\<domain>\
+      Win-ACME         : C:\ProgramData\win-acme\*\Certificates\  (flat, SAN-scanned)
+      Certify the Web  : C:\ProgramData\certify\assets\<id>\  (subdirs, SAN-scanned)
     When -LetsEncryptPath IS supplied, -SAN still filters and validates the
     selected certificate to ensure it covers the specified domain.
 
@@ -680,6 +681,37 @@ function Test-IsCACert {
             }
         }
     } catch {}
+
+    # DER (binary X.509) or PFX/PKCS#12 with empty password (e.g. Certify the Web .cer exports)
+    $certsToScan = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    try {
+        $certsToScan.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($Path))
+    } catch {}
+    try {
+        $col = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $col.Import($Path, [string]::Empty,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet)
+        foreach ($c in $col) { [void]$certsToScan.Add($c) }
+    } catch {}
+    foreach ($cert in $certsToScan) {
+        # Skip CA certs (Basic Constraints OID 2.5.29.19)
+        $bc = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' }
+        if ($bc) {
+            $bcExt = [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]$bc
+            if ($bcExt.CertificateAuthority) { continue }
+        }
+        $cn = $cert.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        if (Test-DomainMatch -Pattern $cn -Domain $Domain) { return $true }
+        $sanExt = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' }
+        if ($sanExt) {
+            foreach ($entry in ($sanExt.Format($false) -split ',\s*|\n')) {
+                if ($entry -match 'DNS Name=(.+)') {
+                    if (Test-DomainMatch -Pattern $Matches[1].Trim() -Domain $Domain) { return $true }
+                }
+            }
+        }
+    }
     return $false
 }
 
@@ -786,6 +818,24 @@ function Find-CertByDomain {
             if ($matchingFiles.Count -gt 0) {
                 Write-Log "  [Win-ACME] $($cd.FullName)"
                 $candidates += [PSCustomObject]@{ Path = $cd.FullName; Source = 'Win-ACME' }
+            }
+        }
+    }
+
+    # ── Certify the Web ──────────────────────────────────────────────────────
+    # Structure: C:\ProgramData\certify\assets\<managed-item-id>\
+    #   Primary:  {id}.pfx or certificate.pfx (PKCS#12)
+    #   Also:     {id}.cer (DER public cert) or PEM exports if post-deployment tasks configured
+    $certifyBase = 'C:\ProgramData\certify\assets'
+    if (Test-Path $certifyBase) {
+        $certifyItemDirs = @(Get-ChildItem -Path $certifyBase -Directory -ErrorAction SilentlyContinue)
+        foreach ($cd in $certifyItemDirs) {
+            $matchingFiles = @(Get-ChildItem -Path $cd.FullName -File -ErrorAction SilentlyContinue |
+                               Where-Object { $_.Extension -in @('.pfx','.p12','.pem','.cer','.crt') } |
+                               Where-Object { Test-CertCoversDomain -Path $_.FullName -Domain $Domain })
+            if ($matchingFiles.Count -gt 0) {
+                Write-Log "  [Certify the Web] $($cd.FullName)"
+                $candidates += [PSCustomObject]@{ Path = $cd.FullName; Source = 'Certify the Web' }
             }
         }
     }
@@ -1560,7 +1610,7 @@ try {
                 $discovered = @(Find-CertByDomain -Domain $SAN)
                 if ($discovered.Count -eq 0) {
                     throw ("No certificates found for '$SAN' in any common ACME client location.`n" +
-                           'Searched: Posh-ACME, Certbot, Win-ACME.`n' +
+                           'Searched: Posh-ACME, Certbot, Win-ACME, Certify the Web.`n' +
                            'Specify -LetsEncryptPath manually if your client stores certs elsewhere.')
                 }
                 $LetsEncryptPath = $discovered[0].Path
